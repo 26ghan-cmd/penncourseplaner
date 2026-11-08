@@ -1,4 +1,4 @@
-# Locust — Penn degree planner
+# Placeholder — Penn degree planner
 
 A four-year course planner for University of Pennsylvania undergrads, inspired by Strata Planner.
 

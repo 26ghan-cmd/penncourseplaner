@@ -1,4 +1,4 @@
-/* Locust — a four-year planner for Penn undergrads. */
+/* Placeholder — a four-year planner for Penn undergrads. */
 (() => {
 "use strict";
 
