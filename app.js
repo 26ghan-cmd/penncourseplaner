@@ -18,12 +18,14 @@ const ATTR_LABEL = {
   AUPW: "Sector VI · Physical World", AUNM: "Sector VII · Natural Sci", AUFS: "First-Year Seminar",
   WUHM: "Wharton · Humanities", WUNM: "Wharton · NatSci/Math/Eng", WUSS: "Wharton · Social Science", WUCN: "Wharton · Cross-Cultural (non-US)",
   WUCU: "Wharton · Cross-Cultural (US)", WUGE: "Wharton · GEBS", WUTI: "Wharton · Tech, Innovation & Analytics", WUCP: "Wharton · Capstone",
+  ACGC: "Cog Sci · Computation & Cognition", ACGN: "Cog Sci · Cognitive Neuroscience", ACGL: "Cog Sci · Language & Mind",
   EUHS: "SEAS · Humanities", EUSS: "SEAS · Social Science", EUTB: "SEAS · Tech, Business & Society", EUMA: "SEAS · Math", EUNS: "SEAS · Natural Science", EUNG: "SEAS · Engineering",
 };
 const ATTR_GROUPS = [
   ["College", ["AUWR", "AULL", "AUQD", "AUFR", "AUCC", "AUCD", "AUSO", "AUHT", "AUAL", "AUHS", "AULW", "AUPW", "AUNM", "AUFS"]],
   ["Wharton", ["WUHM", "WUNM", "WUSS", "WUCN", "WUCU", "WUGE", "WUTI", "WUCP"]],
   ["Engineering", ["EUHS", "EUSS", "EUTB", "EUMA", "EUNS", "EUNG"]],
+  ["Cognitive Science", ["ACGC", "ACGN", "ACGL"]],
 ];
 // AP equivalence: College of Arts & Sciences chart (Class of 2025+), plus school-specific Chemistry awards from Penn Admissions.
 const AP = [
@@ -237,6 +239,7 @@ function missingPrereq(id, k) {
 function ruleMatch(rule, inst) {
   const c = inst.c, id = inst.id;
   if (rule.or) return rule.or.some(r => ruleMatch(r, inst));
+  if (rule.and) return rule.and.every(r => ruleMatch(r, inst));
   if (rule.any) return inst.cu > 0;
   if (rule.ids) return rule.ids.includes(id) || (c && c.xl.some(x => rule.ids.includes(x)));
   if (rule.attr) return (c && rule.attr.some(a => c.attrs.has(a))) || (inst.lang && rule.attr.some(a => a === "AULL" || a === "AULG"));

@@ -221,6 +221,57 @@ const DETAILED = {
   },
 };
 
+
+// Cognitive Science BA (2026-27 catalog): 20 c.u. gen ed + free electives, 16 c.u. major, 36 total.
+const COGS_INTRO = ["COGS-1001","CIS-1400","LING-1005","PHIL-1840","PSYC-1333"];
+const COGS_PHIL = ["PHIL-1170","PHIL-1800","PHIL-1810","PHIL-1830","PHIL-2620","PHIL-2640","PHIL-2660","PHIL-2680","PHIL-3200","PHIL-3620","PHIL-4600","PHIL-4620","PHIL-4640","PHIL-4660","PHIL-4770","PHIL-4840","PHIL-4843","PHIL-6720","PHIL-6770"];
+const COGS_NOTES = [
+  "No more than one major course may also count toward a College Sector (exceptions in the College's policy statement).",
+  "Concentration electives must come from the COGS department's approved list; the planner uses the concentration's course attribute.",
+  "Honors: overall GPA 3.0+, 3.5+ in major-related courses, and COGS 3998 Senior Thesis.",
+];
+function cogsMajor({ conc, attr, comp, lang, phil, neuro, math, psych, extraNotes, source }) {
+  return {
+    school:"COL", totalCU:36, source,
+    groups:[
+      { name:"Core", reqs:[
+        { id:"core", name:"COGS 1001 Introduction to Cognitive Science", count:1, rule:{ids:COGS_INTRO}, note:"Also offered as CIS 1400, LING 1005, PHIL 1840 or PSYC 1333." },
+      ]},
+      { name:"Breadth", reqs:[
+        { id:"psyc", name:psych.name, count:1, rule:psych.rule },
+        { id:"comp", name:"Computation: " + comp.map(c=>c.replace("-"," ")).join(", "), count:1, rule:{ids:comp} },
+        { id:"lang", name:"Language: " + lang.map(c=>c.replace("-"," ")).join(" or "), count:1, rule:{ids:lang} },
+        { id:"phil", name:"Philosophy (approved list)", count:1, rule:{ids:phil} },
+        { id:"neuro", name:"Neuroscience: Cognitive Neuroscience or Intro to Brain & Behavior", count:1, rule:{ids:neuro} },
+        { id:"math", name:"Mathematics: " + math.map(c=>c.replace("-"," ")).join(", "), count:1, rule:{ids:math} },
+      ]},
+      { name:"Concentration: " + conc, reqs:[
+        { id:"conc", name: attr ? `9 c.u. of ${conc} electives (${attr})` : "9 c.u. of advisor-approved concentration electives", unit:"cu", cu:9, rule: attr ? {attr:[attr]} : {or:[{attr:["ACGC","ACGN","ACGL"]},{dept:["COGS","PSYC","LING","PHIL","CIS","NRSC"],min:1000,max:5999}]}, note: attr ? null : "All courses must be approved by your advisor; the planner counts Cog Sci-related courses as a stand-in." },
+      ]},
+    ],
+    notes:[...(extraNotes||[]), ...COGS_NOTES],
+  };
+}
+const NEURO = ["NRSC-2249","PSYC-1230","NRSC-1110","BIOL-1110","PSYC-1210"];
+const PSYC_ACG = { name:"Psychology: a PSYC course (0000–4999) with a Cog Sci attribute", rule:{and:[{dept:["PSYC"],min:0,max:4999},{attr:["ACGC","ACGL","ACGN"]}]} };
+Object.assign(DETAILED, {
+  "Cognitive Science, BA: Computation and Cognition": cogsMajor({ conc:"Computation and Cognition", attr:"ACGC",
+    comp:["CIS-1100","CIS-1200","CIS-1210"], lang:["LING-0001"], phil:COGS_PHIL, neuro:NEURO, math:["STAT-1110","MATH-1400","MATH-1410"], psych:PSYC_ACG,
+    source:"https://catalog.upenn.edu/undergraduate/programs/cognitive-science-computation-cognition-ba" }),
+  "Cognitive Science, BA: Cognitive Neuroscience": cogsMajor({ conc:"Cognitive Neuroscience", attr:"ACGN",
+    comp:["CIS-1100","CIS-1200","CIS-1210"], lang:["LING-0001"], phil:COGS_PHIL, neuro:NEURO, math:["MATH-1400","MATH-1410","STAT-1110"], psych:PSYC_ACG,
+    extraNotes:["Intro to Brain & Behavior (NRSC 1110 / PSYC 1210 / BIOL 1110) must be taken, either as the Neuroscience breadth course or as a concentration elective."],
+    source:"https://catalog.upenn.edu/undergraduate/programs/cognitive-science-cognitive-neuroscience-ba" }),
+  "Cognitive Science, BA: Language & Mind": cogsMajor({ conc:"Language & Mind", attr:"ACGL",
+    comp:["CIS-1100","CIS-1200","CIS-1210","LGIC-1710","PHIL-1710"], lang:["LING-0500"],
+    phil:COGS_PHIL.filter(c=>c!=="PHIL-1170" && c!=="PHIL-6770"), neuro:NEURO, math:["STAT-1110","MATH-1400","MATH-1410","MATH-1510"], psych:PSYC_ACG,
+    source:"https://catalog.upenn.edu/undergraduate/programs/cognitive-science-language-mind-ba" }),
+  "Cognitive Science, BA: Individualized": cogsMajor({ conc:"Individualized", attr:null,
+    comp:["CIS-1100","CIS-1200","LGIC-1710","PHIL-1710"], lang:["LING-0001","LING-0500"], phil:["PHIL-1170","PHIL-2640","PHIL-4660","PHIL-4840"],
+    neuro:NEURO, math:["STAT-1110","MATH-1400","MATH-1410","MATH-1510"], psych:{ name:"Psychology: PSYC 0001 or PSYC 1310", rule:{ids:["PSYC-0001","PSYC-1310"]} },
+    source:"https://catalog.upenn.edu/undergraduate/programs/cognitive-science-individualized-ba" }),
+});
+
 // Generic Wharton concentrations: 4 c.u. in the department (approximate).
 const WH_CONC_DEPT = {
   "Accounting, BS":["ACCT"], "Business Economics and Public Policy, BS":["BEPP"], "Health Care Management and Policy, BS":["HCMG"],
