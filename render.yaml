@@ -16,6 +16,13 @@ services:
         value: "22.13.0"
       - key: DATA_DIR
         value: /var/data
+      # Optional: password-reset emails via Resend (https://resend.com). Leave unset to hide "Forgot password?".
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM          # e.g. "Penn Planner <noreply@yourdomain.com>" (a domain verified in Resend)
+        sync: false
+      - key: APP_URL            # e.g. https://penncourseplaner.onrender.com (used in reset links)
+        sync: false
     disk:
       name: planner-data
       mountPath: /var/data

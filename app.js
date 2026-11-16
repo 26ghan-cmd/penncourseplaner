@@ -217,11 +217,13 @@ let S = defaults();
 loadState(P.privacy.localPlan ? (() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch (e) { return null; } })() : null);
 
 // ---------- saving: account server, Claude storage, or this browser ----------
-const acct = { backend: "unknown", user: null };      // backend: unknown | server | none
+const acct = { backend: "unknown", user: null, mail: false }; // backend: unknown | server | none
+const who = () => acct.user ? (acct.user.email || acct.user.username) : "";
+const whoShort = () => who().split("@")[0];
 const sync = { mode: "local", ref: null, busy: false, pending: false };
 function setSync(txt) { const el = $("#sync"); if (el) el.textContent = txt; }
 function syncLabel() {
-  if (acct.user) return P.privacy.sync ? `Synced to ${acct.user.username}` : "Account sync paused";
+  if (acct.user) return P.privacy.sync ? `Synced to ${whoShort()}` : "Account sync paused";
   if (sync.mode === "cloud") return "Saved to your Claude account";
   return P.privacy.localPlan ? "Saved in this browser" : "Not saved (privacy setting)";
 }
@@ -282,7 +284,12 @@ async function initAccount() {
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
     const r = await fetch("/api/me", { credentials: "same-origin", signal: ctl.signal });
     clearTimeout(t);
-    if (r.ok && (r.headers.get("content-type") || "").includes("json")) { acct.backend = "server"; const d = await r.json(); if (d.user) adoptAccount(d, false); }
+    if (r.ok && (r.headers.get("content-type") || "").includes("json")) {
+      acct.backend = "server"; const d = await r.json(); if (d.user) adoptAccount(d, false);
+      fetch("/api/config").then(x => x.json()).then(c => { acct.mail = !!c.mail; }).catch(() => {});
+      const tok = new URLSearchParams(location.search).get("reset");
+      if (tok) { history.replaceState(null, "", location.pathname + location.hash); resetModal(tok); }
+    }
     else acct.backend = "none";
   } catch (e) { acct.backend = "none"; }
   if (acct.backend === "none") initCloud();
@@ -315,35 +322,63 @@ function authModal(mode = "login") {
   const m = modal(`<div class="row between"><h2 id="amT">${mode === "login" ? "Sign in" : "Create an account"}</h2><button class="btn sm ghost" data-close>✕</button></div>
     <p class="small muted" id="amS">${mode === "login" ? "Pick up your plan on any device." : "Save your plan and settings to an account. Your current plan comes with you."}</p>
     <form id="authf" autocomplete="on">
-      <label class="small muted" for="au">Username</label><input id="au" name="username" type="text" autocomplete="username" required minlength="3" maxlength="32" style="width:100%;margin:4px 0 12px">
+      <label class="small muted" for="au">Email</label><input id="au" name="email" type="text" autocomplete="email" inputmode="email" autocapitalize="off" spellcheck="false" required maxlength="254" placeholder="you@upenn.edu" style="width:100%;margin:4px 0 12px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
       <label class="small muted" for="ap">Password</label><input id="ap" name="password" type="password" autocomplete="${mode === "login" ? "current-password" : "new-password"}" required minlength="8" style="width:100%;margin:4px 0 12px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
       <label class="row small" style="margin-bottom:14px"><input type="checkbox" id="arem" ${P.privacy.remember ? "checked" : ""}> Stay signed in on this device for 30 days</label>
       <div class="small" id="aerr" style="color:var(--sienna);min-height:18px;margin-bottom:6px"></div>
+      ${mode === "login" && acct.mail ? `<div style="text-align:right;margin:-4px 0 10px"><a href="#" class="small" id="aforgot">Forgot password?</a></div>` : ""}
       <button class="btn pri" style="width:100%;justify-content:center" id="asub">${mode === "login" ? "Sign in" : "Create account"}</button>
     </form>
     <p class="small muted" style="text-align:center;margin:14px 0 0">${mode === "login" ? `New here? <a href="#" id="aswap">Create an account</a>` : `Already have one? <a href="#" id="aswap">Sign in</a>`}</p>
-    <p class="small faint" style="margin-top:10px">Passwords are stored as salted scrypt hashes. There's no email recovery, so keep your password somewhere safe.</p>`);
+    <p class="small faint" style="margin-top:10px">Your email is only used to sign in${acct.mail ? " and reset your password" : ""} — never shared or used for marketing. Passwords are stored as salted scrypt hashes.</p>`);
   $("#aswap", m).onclick = e => { e.preventDefault(); m.remove(); authModal(mode === "login" ? "signup" : "login"); };
+  const fg = $("#aforgot", m); if (fg) fg.onclick = e => { e.preventDefault(); const em = $("#au", m).value.trim(); m.remove(); forgotModal(em); };
   $("#au", m).focus();
   $("#authf", m).addEventListener("submit", async e => {
     e.preventDefault();
-    const username = $("#au", m).value.trim(), password = $("#ap", m).value, remember = $("#arem", m).checked;
+    const email = $("#au", m).value.trim(), password = $("#ap", m).value, remember = $("#arem", m).checked;
     $("#asub", m).disabled = true; $("#aerr", m).textContent = "";
     try {
-      const body = { username, password, remember };
+      const body = { email, password, remember };
       if (mode === "signup") { body.state = stateJSON(); body.prefs = syncablePrefs(); }
       const data = await apiCall("POST", mode === "login" ? "/api/login" : "/api/signup", body);
       if (P.privacy.remember !== remember) { P.privacy.remember = remember; persistPrefs(); }
       m.remove(); adoptAccount(data, mode === "login"); renderAcct(); render();
-      toast(mode === "login" ? `Signed in as ${data.user.username}` : `Welcome, ${data.user.username}! Your plan is saved to your account.`);
+      toast(mode === "login" ? `Signed in as ${who()}` : `Welcome! Your plan is saved to ${who()}.`);
     } catch (err) { $("#aerr", m).textContent = err.message; $("#asub", m).disabled = false; }
+  });
+}
+function forgotModal(prefill = "") {
+  const m = modal(`<div class="row between"><h2>Reset your password</h2><button class="btn sm ghost" data-close>✕</button></div>
+    <p class="small muted">Enter the email you signed up with. If it has an account, we'll send a link to choose a new password.</p>
+    <form id="fgf"><input id="fge" type="email" autocomplete="email" required value="${esc(prefill)}" placeholder="you@upenn.edu" style="width:100%;margin:4px 0 12px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
+    <div class="small" id="fgerr" style="color:var(--sienna);min-height:18px;margin-bottom:6px"></div>
+    <button class="btn pri" id="fgb" style="width:100%;justify-content:center">Send reset link</button></form>`);
+  $("#fge", m).focus();
+  $("#fgf", m).addEventListener("submit", async e => {
+    e.preventDefault(); $("#fgb", m).disabled = true;
+    try { await apiCall("POST", "/api/forgot", { email: $("#fge", m).value.trim() });
+      $(".modal", m).innerHTML = `<h2>Check your email</h2><p class="muted">If an account exists for that address, a reset link is on its way. It works for one hour.</p><div class="row" style="justify-content:flex-end"><button class="btn pri" data-close>OK</button></div>`; }
+    catch (err) { $("#fgerr", m).textContent = err.message; $("#fgb", m).disabled = false; }
+  });
+}
+function resetModal(token) {
+  const m = modal(`<h2>Choose a new password</h2><p class="small muted">After this you'll be signed in, and signed out everywhere else.</p>
+    <form id="rsf"><input id="rsp" type="password" autocomplete="new-password" required minlength="8" placeholder="New password (8+ characters)" style="width:100%;margin:4px 0 12px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
+    <div class="small" id="rserr" style="color:var(--sienna);min-height:18px;margin-bottom:6px"></div>
+    <button class="btn pri" id="rsb" style="width:100%;justify-content:center">Set password</button></form>`);
+  $("#rsp", m).focus();
+  $("#rsf", m).addEventListener("submit", async e => {
+    e.preventDefault(); $("#rsb", m).disabled = true;
+    try { const data = await apiCall("POST", "/api/reset", { token, password: $("#rsp", m).value, remember: P.privacy.remember }); m.remove(); adoptAccount(data, true); renderAcct(); render(); toast("Password updated — you're signed in"); }
+    catch (err) { $("#rserr", m).textContent = err.message; $("#rsb", m).disabled = false; }
   });
 }
 function renderAcct() {
   const el = $("#acct"); if (!el) return;
   if (acct.backend !== "server") { el.innerHTML = ""; return; }
   el.innerHTML = acct.user
-    ? `<button class="btn sm" data-act="acctmenu" aria-label="Account menu"><span class="avatar">${esc(acct.user.username[0].toUpperCase())}</span>${esc(acct.user.username)}</button>`
+    ? `<button class="btn sm" data-act="acctmenu" aria-label="Account menu"><span class="avatar">${esc(who()[0].toUpperCase())}</span><span class="acctname">${esc(whoShort())}</span></button>`
     : `<button class="btn sm" data-act="signin">Sign in</button><button class="btn sm pri" data-act="signup">Create account</button>`;
 }
 function cookieNotice() {
@@ -852,8 +887,11 @@ function vSettings() {
   // Account
   let account;
   if (acct.backend === "server" && acct.user) {
-    account = `<div class="row between"><div class="row"><span class="avatar lg">${esc(acct.user.username[0].toUpperCase())}</span><div><div style="font-weight:600;font-size:16px">${esc(acct.user.username)}</div><div class="small muted">Member since ${new Date(acct.user.createdAt).toLocaleDateString(undefined, { month: "long", year: "numeric" })} · ${esc(syncLabel())}</div></div></div>
+    account = `<div class="row between"><div class="row"><span class="avatar lg">${esc(who()[0].toUpperCase())}</span><div><div style="font-weight:600;font-size:16px">${esc(who())}</div><div class="small muted">Member since ${new Date(acct.user.createdAt).toLocaleDateString(undefined, { month: "long", year: "numeric" })} · ${esc(syncLabel())}</div></div></div>
       <div class="row"><button class="btn" data-act="signout">Sign out</button></div></div>
+      ${acct.user.email ? "" : `<div class="note" style="border-color:var(--sienna)">This account was made with a username. Add an email so you can sign in with it${acct.mail ? " and reset your password" : ""}.</div>`}
+      <h3 style="margin-top:22px">${acct.user.email ? "Change email" : "Add an email"}</h3>
+      <form id="emform" class="row"><input type="email" name="email" placeholder="New email" autocomplete="email" required style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px"><input type="password" name="password" placeholder="Current password" autocomplete="current-password" required style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px"><button class="btn">${acct.user.email ? "Update" : "Add"}</button></form>
       <h3 style="margin-top:22px">Change password</h3>
       <form id="pwform" class="row"><input type="password" name="current" placeholder="Current password" autocomplete="current-password" required style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px"><input type="password" name="next" placeholder="New password (8+ characters)" autocomplete="new-password" required minlength="8" style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px"><button class="btn">Update</button></form>
       <p class="small faint" style="margin:6px 0 0">Changing your password signs you out everywhere else.</p>
@@ -886,7 +924,7 @@ function vSettings() {
     ${acct.user ? tg("privacy.sync", "Sync my plan to my account", "Off: changes stay on this device and your account keeps its last saved plan.", pv.sync) : ""}
     ${tg("privacy.googleFonts", "Load fonts from Google Fonts", "Off: uses your system's fonts so no request goes to Google.", pv.googleFonts)}
     <div class="row" style="margin-top:14px"><button class="btn" data-act="clearlocal" style="color:var(--sienna)">Clear cookies &amp; data on this device</button></div>
-    <dl class="kv small" style="margin-top:16px"><dt>plnr_prefs</dt><dd>Cookie · your preferences · 1 year${pv.cookies ? "" : " (choice only)"}</dd>${acct.backend === "server" ? `<dt>plnr_sid</dt><dd>Cookie · keeps you signed in · HttpOnly, can't be read by scripts</dd>` : ""}<dt>Local storage</dt><dd>${pv.localPlan ? "Your plan, on this device only" : "Not used"}</dd>${acct.user ? `<dt>Account</dt><dd>Username, password hash, your plan and preferences</dd>` : ""}</dl>`;
+    <dl class="kv small" style="margin-top:16px"><dt>plnr_prefs</dt><dd>Cookie · your preferences · 1 year${pv.cookies ? "" : " (choice only)"}</dd>${acct.backend === "server" ? `<dt>plnr_sid</dt><dd>Cookie · keeps you signed in · HttpOnly, can't be read by scripts</dd>` : ""}<dt>Local storage</dt><dd>${pv.localPlan ? "Your plan, on this device only" : "Not used"}</dd>${acct.user ? `<dt>Account</dt><dd>Email, password hash, your plan and preferences</dd>` : ""}</dl>`;
 
   return `<h1>Settings</h1><p class="sub">${esc(syncLabel())}.</p>
   <div class="setwrap"><nav class="setnav">${SETTINGS_SECTIONS.map(([id, l]) => `<a href="#settings" data-act="setjump" data-s="${id}">${l}</a>`).join("")}</nav>
@@ -905,6 +943,12 @@ function vSettings() {
 after.settings = () => {
   const i = $("#smq");
   if (i) { let t; i.addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => { UI.setMajorQ = i.value; const y = scrollY; render(); scrollTo(0, y); const n = $("#smq"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); }, 150); }); }
+  const ef = $("#emform");
+  if (ef) ef.addEventListener("submit", async e => {
+    e.preventDefault(); const f = new FormData(ef);
+    try { const d = await apiCall("POST", "/api/email", { email: f.get("email"), password: f.get("password") }); acct.user = d.user; renderAcct(); keepScroll(render); toast(`Email updated to ${d.user.email}`); }
+    catch (err) { toast(err.message); }
+  });
   const pf = $("#pwform");
   if (pf) pf.addEventListener("submit", async e => {
     e.preventDefault(); const f = new FormData(pf);
@@ -913,7 +957,7 @@ after.settings = () => {
   });
 };
 function deleteAccountModal() {
-  const m = modal(`<h2>Delete your account?</h2><p class="muted">This permanently deletes <b>${esc(acct.user.username)}</b>, its saved plan and preferences. It can't be undone. Your plan stays in this browser unless you've turned that off.</p>
+  const m = modal(`<h2>Delete your account?</h2><p class="muted">This permanently deletes the account for <b>${esc(who())}</b>, its saved plan and preferences. It can't be undone. Your plan stays in this browser unless you've turned that off.</p>
     <input type="password" id="dpw" placeholder="Enter your password to confirm" autocomplete="current-password" style="width:100%;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
     <div class="small" id="derr" style="color:var(--sienna);min-height:18px;margin-top:6px"></div>
     <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="btn" data-close>Cancel</button><button class="btn pri" id="dok" style="background:var(--sienna);border-color:var(--sienna)">Delete account</button></div>`);
@@ -1006,7 +1050,7 @@ document.addEventListener("click", e => {
   else if (act === "signin") { closeMenu(); authModal("login"); }
   else if (act === "signup") { closeMenu(); authModal("signup"); }
   else if (act === "signout") { closeMenu(); signOut(); }
-  else if (act === "acctmenu") { const r = a.getBoundingClientRect(); openMenu(r.right - 220, r.bottom + 6, `<div class="lbl">Signed in as ${esc(acct.user.username)}</div><div class="lbl" style="text-transform:none;letter-spacing:0">${esc(syncLabel())}</div><div class="sep"></div><button data-act="gosettings">Account &amp; settings</button><button data-act="signout">Sign out</button>`); }
+  else if (act === "acctmenu") { const r = a.getBoundingClientRect(); openMenu(r.right - 220, r.bottom + 6, `<div class="lbl" style="text-transform:none;letter-spacing:0">Signed in as ${esc(who())}</div><div class="lbl" style="text-transform:none;letter-spacing:0">${esc(syncLabel())}</div><div class="sep"></div><button data-act="gosettings">Account &amp; settings</button><button data-act="signout">Sign out</button>`); }
   else if (act === "gosettings") { closeMenu(); go("settings"); }
   else if (act === "logoutall") { apiCall("POST", "/api/logout-all", {}).then(() => toast("Signed out of all other devices"), err => toast(err.message)); }
   else if (act === "delacct") deleteAccountModal();

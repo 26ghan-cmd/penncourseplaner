@@ -6,7 +6,7 @@ A four-year course planner for University of Pennsylvania undergrads, inspired b
 - Plan Fall/Spring/Summer semesters with drag and drop
 - Track College, Wharton, Engineering and Nursing requirements, plus mapped majors
 - Weekly schedule with conflict checks, AP/transfer credit, exportable plan
-- Accounts: save your plan and settings and open them on any device
+- Accounts (email + password): save your plan and settings and open them on any device
 - Settings: light/dark/system theme, privacy controls, school and majors
 
 ## Running it
@@ -19,6 +19,16 @@ npm start            # http://localhost:3000
 
 Environment variables: `PORT` (default 3000), `DATA_DIR` (where the SQLite database lives, default `./data`),
 `NODE_ENV=production` (marks the session cookie Secure; use behind HTTPS).
+
+### Password-reset emails (optional)
+
+Set these to turn on "Forgot password?" (emails are sent through [Resend](https://resend.com)'s API):
+
+- `RESEND_API_KEY`: your Resend API key
+- `MAIL_FROM`: sender address on a domain you've verified in Resend, e.g. `Penn Planner <noreply@yourdomain.com>`
+- `APP_URL`: the site's public URL, used in reset links, e.g. `https://penncourseplaner.onrender.com`
+
+Without them, accounts work normally but there's no self-service reset.
 
 ## Deploying on Render
 
@@ -37,7 +47,7 @@ on every deploy or restart.
 - `plnr_prefs` cookie: theme, display and warning preferences (1 year; can be turned off in Settings → Privacy)
 - `plnr_sid` cookie: HttpOnly session token (30 days, or about a day if "Stay signed in" is off)
 - Browser local storage: a copy of your plan (can be turned off)
-- Server: username, scrypt password hash, your plan and preferences. No email, no tracking.
+- Server: email, scrypt password hash, your plan and preferences. Email is used only to sign in and for reset links. No tracking.
 
 Without the server (any static host), the planner still works and saves to the browser only.
 
