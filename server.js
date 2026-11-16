@@ -11,14 +11,28 @@ const { DatabaseSync } = require("node:sqlite");
 
 const PORT = +process.env.PORT || 3000;
 const ROOT = __dirname;
-const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
+// Where the SQLite database lives. On Render this should be a persistent disk; if DATA_DIR
+// isn't writable (e.g. no disk attached), fall back to a local folder so the site still runs.
+function pickDataDir() {
+  const fallback = path.join(ROOT, "data");
+  const want = process.env.DATA_DIR;
+  if (want) {
+    try { fs.mkdirSync(want, { recursive: true }); fs.accessSync(want, fs.constants.W_OK); return want; }
+    catch (e) {
+      console.warn(`WARNING: DATA_DIR "${want}" isn't writable (${e.code}). Is a persistent disk mounted there?`);
+      console.warn(`WARNING: Falling back to ${fallback}. Accounts saved there are lost on every deploy or restart.`);
+    }
+  }
+  fs.mkdirSync(fallback, { recursive: true });
+  return fallback;
+}
+const DATA_DIR = pickDataDir();
 const PROD = process.env.NODE_ENV === "production";
 const SESSION_COOKIE = "plnr_sid";
 const SESSION_DAYS = 30;
 const MAX_BODY = 512 * 1024;
 
 // ---------- database ----------
-fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, "planner.db"));
 db.exec(`
   PRAGMA journal_mode = WAL;
