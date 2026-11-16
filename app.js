@@ -8,6 +8,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const fmtCU = n => (Math.round(n * 100) / 100).toString();
 const uid = () => Math.random().toString(36).slice(2, 10);
 const codeOf = id => id.replace("-", " ");
+function keepScroll(fn) { const y = window.scrollY; fn(); window.scrollTo(0, y); }
 function toast(msg) { const t = document.createElement("div"); t.className = "toast"; t.textContent = msg; document.body.appendChild(t); setTimeout(() => t.remove(), 2200); }
 
 // ---------- static data ----------
@@ -141,34 +142,124 @@ function schoolDef() {
 }
 const catalogLink = name => "https://catalog.upenn.edu/search/?search=" + encodeURIComponent(name);
 
-// ---------- state ----------
-const LS_KEY = "locust-penn-v1";
-const defaults = () => ({ v: 1, school: null, start: null, years: 4, programs: [], plan: {}, bm: [], ap: {}, transfer: [], prefs: { desc: true, per: 10, dense: false, warn: { remove: true, offered: true, conflict: true, program: true } }, updated: 0 });
-let S = defaults();
-try { const raw = localStorage.getItem(LS_KEY); if (raw) S = Object.assign(defaults(), JSON.parse(raw)); } catch (e) {}
-S.prefs = Object.assign(defaults().prefs, S.prefs || {}); S.prefs.warn = Object.assign(defaults().prefs.warn, S.prefs.warn || {});
+// ---------- preferences (cookie) ----------
+// Preferences live in a first-party cookie ("plnr_prefs") so they apply before the page draws
+// (theme) and survive without an account. Signed-in users also sync them to their account.
+const PREF_COOKIE = "plnr_prefs";
+const prefDefaults = () => ({
+  theme: "system", desc: true, per: 10, dense: false,
+  warn: { remove: true, offered: true, conflict: true, program: true },
+  privacy: { cookies: true, localPlan: true, remember: true, sync: true, googleFonts: true },
+  notice: false,
+});
+function mergePrefs(base, src) {
+  const out = Object.assign(base, src || {});
+  out.warn = Object.assign(prefDefaults().warn, (src && src.warn) || {});
+  out.privacy = Object.assign(prefDefaults().privacy, (src && src.privacy) || {});
+  return out;
+}
+function readCookie(name) {
+  try { const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)")); return m ? decodeURIComponent(m[1]) : null; } catch (e) { return null; }
+}
+function writeCookie(name, value, maxAgeDays) {
+  try {
+    const secure = location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${Math.round(maxAgeDays * 86400)}; SameSite=Lax${secure}`;
+    return readCookie(name) !== null || maxAgeDays <= 0;
+  } catch (e) { return false; }
+}
+let P = prefDefaults();
+(() => {
+  let raw = readCookie(PREF_COOKIE);
+  if (!raw) { try { raw = localStorage.getItem(PREF_COOKIE); } catch (e) {} }
+  if (raw) { try { P = mergePrefs(prefDefaults(), JSON.parse(raw)); } catch (e) {} }
+})();
+const COOKIES_WORK = (() => { try { document.cookie = "plnr_t=1; Path=/; SameSite=Lax"; const ok = readCookie("plnr_t") === "1"; document.cookie = "plnr_t=; Path=/; Max-Age=0"; return ok; } catch (e) { return false; } })();
+function persistPrefs() {
+  const body = JSON.stringify(P);
+  if (P.privacy.cookies) {
+    if (!writeCookie(PREF_COOKIE, body, 365)) { try { localStorage.setItem(PREF_COOKIE, body); } catch (e) {} }
+  } else {
+    // Only remember the choice itself (strictly necessary); nothing else is stored.
+    writeCookie(PREF_COOKIE, JSON.stringify({ privacy: { cookies: false }, notice: true }), 365);
+    try { localStorage.removeItem(PREF_COOKIE); } catch (e) {}
+  }
+}
+let prefsTimer = null;
+function savePrefs() {
+  persistPrefs(); applyTheme();
+  if (acct.user) { clearTimeout(prefsTimer); prefsTimer = setTimeout(() => apiCall("PUT", "/api/prefs", { prefs: syncablePrefs() }).catch(() => {}), 800); }
+}
+// Privacy choices are per device; everything else follows the account.
+const syncablePrefs = () => { const { privacy, notice, ...rest } = P; return rest; };
+function applyTheme() {
+  document.documentElement.setAttribute("data-theme", P.theme || "system");
+  const has = document.getElementById("gfonts");
+  if (P.privacy.googleFonts && !has) {
+    const l = document.createElement("link"); l.id = "gfonts"; l.rel = "stylesheet";
+    l.href = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600&family=JetBrains+Mono:wght@500&display=swap";
+    document.head.appendChild(l);
+  } else if (!P.privacy.googleFonts && has) has.remove();
+}
 
-const sync = { mode: "local", ref: null, busy: false, pending: false, note: "" };
+// ---------- plan state ----------
+const LS_KEY = "locust-penn-v1";
+const defaults = () => ({ v: 1, school: null, start: null, years: 4, programs: [], plan: {}, bm: [], ap: {}, transfer: [], updated: 0 });
+function loadState(obj) {
+  const s = Object.assign(defaults(), obj || {});
+  if (s.prefs && !readCookie(PREF_COOKIE)) mergePrefs(P, s.prefs); // migrate prefs saved by older versions
+  delete s.prefs;
+  S = s; S.prefs = P; // views read S.prefs; it is the same object as P
+}
+const stateJSON = () => { const { prefs, ...rest } = S; return rest; };
+const hasPlan = s => !!(s && (s.programs?.length || Object.values(s.plan || {}).some(a => a.length) || s.school));
+let S = defaults();
+loadState(P.privacy.localPlan ? (() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch (e) { return null; } })() : null);
+
+// ---------- saving: account server, Claude storage, or this browser ----------
+const acct = { backend: "unknown", user: null };      // backend: unknown | server | none
+const sync = { mode: "local", ref: null, busy: false, pending: false };
 function setSync(txt) { const el = $("#sync"); if (el) el.textContent = txt; }
-function syncLabel() { return sync.mode === "cloud" ? "Saved to your Claude account" : sync.mode === "local" ? "Saved in this browser" : "Not saved"; }
+function syncLabel() {
+  if (acct.user) return P.privacy.sync ? `Synced to ${acct.user.username}` : "Account sync paused";
+  if (sync.mode === "cloud") return "Saved to your Claude account";
+  return P.privacy.localPlan ? "Saved in this browser" : "Not saved (privacy setting)";
+}
+async function apiCall(method, url, body) {
+  const r = await fetch(url, { method, credentials: "same-origin", headers: body ? { "Content-Type": "application/json", "X-Planner": "1" } : {}, body: body ? JSON.stringify(body) : undefined });
+  let data = null; try { data = await r.json(); } catch (e) {}
+  if (!r.ok) throw Object.assign(new Error((data && data.error) || "Request failed"), { status: r.status });
+  return data;
+}
 let saveTimer = null;
+function saveLocal() {
+  try { if (P.privacy.localPlan) localStorage.setItem(LS_KEY, JSON.stringify(stateJSON())); else localStorage.removeItem(LS_KEY); } catch (e) {}
+}
 function save() {
   S.updated = Date.now();
-  try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {}
-  if (sync.mode !== "cloud") { setSync(syncLabel()); return; }
-  setSync("Saving…");
-  clearTimeout(saveTimer); saveTimer = setTimeout(pushCloud, 900);
+  saveLocal();
+  if (acct.user && P.privacy.sync) { setSync("Saving…"); clearTimeout(saveTimer); saveTimer = setTimeout(pushServer, 700); return; }
+  if (sync.mode === "cloud") { setSync("Saving…"); clearTimeout(saveTimer); saveTimer = setTimeout(pushCloud, 900); return; }
+  setSync(syncLabel());
+}
+async function pushServer() {
+  if (sync.busy) { sync.pending = true; return; }
+  sync.busy = true;
+  try { await apiCall("PUT", "/api/state", { state: stateJSON() }); setSync(syncLabel()); }
+  catch (e) { if (e.status === 401) { acct.user = null; renderAcct(); toast("You were signed out. Sign in again to keep syncing."); } else setSync("Couldn't save — will retry"); }
+  sync.busy = false;
+  if (sync.pending) { sync.pending = false; pushServer(); }
 }
 async function pushCloud() {
   if (!sync.ref) return;
   if (sync.busy) { sync.pending = true; return; }
   sync.busy = true;
-  try { await sync.ref.set({ json: JSON.stringify(S), updated: S.updated }); setSync(syncLabel()); }
+  try { await sync.ref.set({ json: JSON.stringify(stateJSON()), updated: S.updated }); setSync(syncLabel()); }
   catch (e) { if (e && e.code === "invalid_argument") { sync.mode = "local"; } setSync(syncLabel()); }
   sync.busy = false;
   if (sync.pending) { sync.pending = false; pushCloud(); }
 }
-async function initCloud() {
+async function initCloud() { // Claude-hosted copy: per-user storage provided by the page runtime
   if (!window.claude || !window.claude.use) return;
   try {
     const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
@@ -179,16 +270,89 @@ async function initCloud() {
     sync.ref = ref; sync.mode = "cloud";
     if (snap.exists) {
       const body = snap.data();
-      if (body && body.json && (body.updated || 0) > (S.updated || 0)) {
-        S = Object.assign(defaults(), JSON.parse(body.json));
-        S.prefs = Object.assign(defaults().prefs, S.prefs || {}); S.prefs.warn = Object.assign(defaults().prefs.warn, S.prefs.warn || {});
-        try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {}
-        render();
-      } else if (S.updated) pushCloud();
+      if (body && body.json && (body.updated || 0) > (S.updated || 0)) { loadState(JSON.parse(body.json)); saveLocal(); render(); }
+      else if (S.updated) pushCloud();
     } else if (S.updated) pushCloud();
     setSync(syncLabel());
   } catch (e) { setSync(syncLabel()); }
 }
+// Ask the server who's signed in. A static host or sandbox has no /api, so we fall back.
+async function initAccount() {
+  try {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch("/api/me", { credentials: "same-origin", signal: ctl.signal });
+    clearTimeout(t);
+    if (r.ok && (r.headers.get("content-type") || "").includes("json")) { acct.backend = "server"; const d = await r.json(); if (d.user) adoptAccount(d, false); }
+    else acct.backend = "none";
+  } catch (e) { acct.backend = "none"; }
+  if (acct.backend === "none") initCloud();
+  renderAcct(); render();
+}
+function adoptAccount(data, fromLogin) {
+  acct.user = data.user;
+  if (data.prefs) { mergePrefs(P, { ...data.prefs, privacy: P.privacy, notice: P.notice }); persistPrefs(); applyTheme(); }
+  const local = stateJSON();
+  if (data.state && hasPlan(data.state)) {
+    if (fromLogin && hasPlan(local) && JSON.stringify(data.state.plan) !== JSON.stringify(local.plan)) { askWhichPlan(data.state, local); return; }
+    loadState(data.state); saveLocal();
+  } else if (hasPlan(local) && P.privacy.sync) pushServer();
+}
+function askWhichPlan(remote, local) {
+  const n = s => Object.values(s.plan || {}).reduce((a, x) => a + x.length, 0);
+  const m = modal(`<h2>Which plan should we keep?</h2><p class="muted">Your account already has a saved plan, and this browser has a different one.</p>
+    <div class="grid g2" style="margin-top:14px"><button class="btn" id="kpR" style="justify-content:flex-start;padding:14px;text-align:left;white-space:normal"><span><b>Plan saved in my account</b><br><span class="small muted">${n(remote)} courses · ${esc((remote.programs || []).join(", ") || "no programs")}</span></span></button>
+    <button class="btn" id="kpL" style="justify-content:flex-start;padding:14px;text-align:left;white-space:normal"><span><b>Plan in this browser</b><br><span class="small muted">${n(local)} courses · ${esc((local.programs || []).join(", ") || "no programs")} — replaces the account's plan</span></span></button></div>`);
+  $("#kpR", m).onclick = () => { m.remove(); loadState(remote); saveLocal(); render(); toast("Loaded your account's plan"); };
+  $("#kpL", m).onclick = () => { m.remove(); save(); render(); toast("Saved this browser's plan to your account"); };
+}
+async function signOut() {
+  try { await apiCall("POST", "/api/logout", {}); } catch (e) {}
+  acct.user = null;
+  if (!P.privacy.localPlan) { loadState(null); }
+  renderAcct(); render(); toast("Signed out");
+}
+function authModal(mode = "login") {
+  const m = modal(`<div class="row between"><h2 id="amT">${mode === "login" ? "Sign in" : "Create an account"}</h2><button class="btn sm ghost" data-close>✕</button></div>
+    <p class="small muted" id="amS">${mode === "login" ? "Pick up your plan on any device." : "Save your plan and settings to an account. Your current plan comes with you."}</p>
+    <form id="authf" autocomplete="on">
+      <label class="small muted" for="au">Username</label><input id="au" name="username" type="text" autocomplete="username" required minlength="3" maxlength="32" style="width:100%;margin:4px 0 12px">
+      <label class="small muted" for="ap">Password</label><input id="ap" name="password" type="password" autocomplete="${mode === "login" ? "current-password" : "new-password"}" required minlength="8" style="width:100%;margin:4px 0 12px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
+      <label class="row small" style="margin-bottom:14px"><input type="checkbox" id="arem" ${P.privacy.remember ? "checked" : ""}> Stay signed in on this device for 30 days</label>
+      <div class="small" id="aerr" style="color:var(--sienna);min-height:18px;margin-bottom:6px"></div>
+      <button class="btn pri" style="width:100%;justify-content:center" id="asub">${mode === "login" ? "Sign in" : "Create account"}</button>
+    </form>
+    <p class="small muted" style="text-align:center;margin:14px 0 0">${mode === "login" ? `New here? <a href="#" id="aswap">Create an account</a>` : `Already have one? <a href="#" id="aswap">Sign in</a>`}</p>
+    <p class="small faint" style="margin-top:10px">Passwords are stored as salted scrypt hashes. There's no email recovery, so keep your password somewhere safe.</p>`);
+  $("#aswap", m).onclick = e => { e.preventDefault(); m.remove(); authModal(mode === "login" ? "signup" : "login"); };
+  $("#au", m).focus();
+  $("#authf", m).addEventListener("submit", async e => {
+    e.preventDefault();
+    const username = $("#au", m).value.trim(), password = $("#ap", m).value, remember = $("#arem", m).checked;
+    $("#asub", m).disabled = true; $("#aerr", m).textContent = "";
+    try {
+      const body = { username, password, remember };
+      if (mode === "signup") { body.state = stateJSON(); body.prefs = syncablePrefs(); }
+      const data = await apiCall("POST", mode === "login" ? "/api/login" : "/api/signup", body);
+      if (P.privacy.remember !== remember) { P.privacy.remember = remember; persistPrefs(); }
+      m.remove(); adoptAccount(data, mode === "login"); renderAcct(); render();
+      toast(mode === "login" ? `Signed in as ${data.user.username}` : `Welcome, ${data.user.username}! Your plan is saved to your account.`);
+    } catch (err) { $("#aerr", m).textContent = err.message; $("#asub", m).disabled = false; }
+  });
+}
+function renderAcct() {
+  const el = $("#acct"); if (!el) return;
+  if (acct.backend !== "server") { el.innerHTML = ""; return; }
+  el.innerHTML = acct.user
+    ? `<button class="btn sm" data-act="acctmenu" aria-label="Account menu"><span class="avatar">${esc(acct.user.username[0].toUpperCase())}</span>${esc(acct.user.username)}</button>`
+    : `<button class="btn sm" data-act="signin">Sign in</button><button class="btn sm pri" data-act="signup">Create account</button>`;
+}
+function cookieNotice() {
+  if (P.notice || !COOKIES_WORK || $(".cnotice")) return;
+  const d = document.createElement("div"); d.className = "cnotice";
+  d.innerHTML = `<span>This site uses cookies only to keep you signed in and remember your preferences — no ads or tracking.</span><span class="row" style="gap:8px"><a href="#settings" class="btn sm" data-act="cnset">Privacy settings</a><button class="btn sm pri" data-act="cnok">OK</button></span>`;
+  document.body.appendChild(d);
+}
+applyTheme();
 
 // ---------- plan helpers ----------
 const termItems = k => (S.plan[k] = S.plan[k] || []);
@@ -446,7 +610,7 @@ function filteredCourses() {
   return list.sort(sorts[UI.sort] || sorts.rec);
 }
 function vCourses() {
-  const list = filteredCourses(); const per = S.prefs.per || 10;
+  const list = filteredCourses(); const per = P.per || 10;
   const pages = Math.max(1, Math.ceil(list.length / per)); UI.page = Math.min(UI.page, pages - 1);
   const slice = list.slice(UI.page * per, UI.page * per + per);
   let reqLabel = "";
@@ -473,7 +637,7 @@ function vCourses() {
     <div>
       <div class="card" style="padding:0">
         <div class="pager" style="border-bottom:1px solid var(--line);padding:10px 16px"><span>${list.length ? `${(UI.page * per + 1).toLocaleString()}–${Math.min(list.length, UI.page * per + per).toLocaleString()} of ${list.length.toLocaleString()}` : "No matches"}</span>${pagerBtns(pages)}</div>
-        ${slice.map(c => courseRow(c, { desc: S.prefs.desc, reqHi: EV.progs.length })).join("") || `<div class="empty" style="padding:30px">No courses match these filters.</div>`}
+        ${slice.map(c => courseRow(c, { desc: P.desc, reqHi: EV.progs.length })).join("") || `<div class="empty" style="padding:30px">No courses match these filters.</div>`}
         <div class="pager" style="border-top:1px solid var(--line);padding:10px 16px"><span></span>${pagerBtns(pages)}</div>
       </div>
     </div>
@@ -514,18 +678,18 @@ function chipHTML(it, k) {
   const notOff = k && c && !offeredIn(c, k);
   const cls = miss || notOff ? "warn" : cnt ? "creq" : "";
   const tip = [cnt ? "Counts toward: " + cnt.map(x => x.r.name).join("; ") : "", miss ? "May be missing a prerequisite: " + miss.map(g => g.map(codeOf).join(" or ")).join(" and ") : "", notOff ? `Not offered in ${SEASON[k[4]].toLowerCase()} in 2025–27` : "", inst?.dup ? "Planned twice; counts once" : ""].filter(Boolean).join("\n");
-  return `<div class="chip ${cls}" draggable="true" data-key="${it.k}" data-act="chip" title="${esc(tip)}"><span class="cc">${esc(codeOf(it.id))}</span><span class="ct">${S.prefs.dense ? "" : esc(c?.t || "")}</span>${inst?.dup ? '<span class="x2">×2</span>' : ""}<span class="cu">${fmtCU(c?.cu || 1)}</span></div>`;
+  return `<div class="chip ${cls}" draggable="true" data-key="${it.k}" data-act="chip" title="${esc(tip)}"><span class="cc">${esc(codeOf(it.id))}</span><span class="ct">${P.dense ? "" : esc(c?.t || "")}</span>${inst?.dup ? '<span class="x2">×2</span>' : ""}<span class="cu">${fmtCU(c?.cu || 1)}</span></div>`;
 }
 function vPlan() {
   if (!S.start) return `<h1>Planner</h1><p class="sub">Set the fall you started at Penn to lay out your semesters.</p><div class="card"><div class="row"><span>I started (or will start) in Fall</span><select data-change="start"><option value="">Year…</option>${[2022, 2023, 2024, 2025, 2026, 2027].map(y => `<option>${y}</option>`).join("")}</select></div></div>`;
   const years = termsFor(S.start, S.years || 4);
   const pastWarn = k => isStarted(k);
   return `<div class="hero"><div><h1>Planner</h1><p class="sub" style="margin:0">Drag courses between semesters. Click a course for options. ${fmtCU(EV.totalCU)} of ${EV.targetCU} c.u. planned.</p></div>
-    <div class="row"><label class="row small"><input type="checkbox" data-change="dense" ${S.prefs.dense ? "checked" : ""}> Compact</label><button class="btn sm" data-act="years" data-d="${(S.years || 4) === 4 ? 5 : 4}">${(S.years || 4) === 4 ? "+ Add a 5th year" : "Remove 5th year"}</button></div></div>
+    <div class="row"><label class="row small"><input type="checkbox" data-change="dense" ${P.dense ? "checked" : ""}> Compact</label><button class="btn sm" data-act="years" data-d="${(S.years || 4) === 4 ? 5 : 4}">${(S.years || 4) === 4 ? "+ Add a 5th year" : "Remove 5th year"}</button></div></div>
   <div class="legend" style="margin-bottom:14px"><span><span class="sw"></span>Elective</span><span><span class="sw g"></span>Counts toward a requirement</span><span><span class="sw s"></span>Prerequisite or offering warning</span><span><span class="sw d"></span>Semester already started</span><span><span class="x2" style="font-size:10.5px;font-weight:700;background:var(--ink);color:var(--bg);border-radius:4px;padding:0 4px">×2</span> Planned twice</span></div>
   <div class="card" style="margin-bottom:20px;padding:14px"><div class="row between" style="margin-bottom:8px"><h3 style="margin:0">Bookmarked</h3><span class="small faint">Drag into a semester to schedule; drag back to unschedule.</span></div>
     <div class="tray" data-drop="tray">${S.bm.map(id => { const c = COURSES.get(id); return c ? `<div class="chip" draggable="true" data-bm="${id}" data-act="bmchip"><span class="cc">${esc(codeOf(id))}</span><span class="ct" style="max-width:180px">${esc(c.t)}</span><span class="cu">${fmtCU(c.cu)}</span></div>` : ""; }).join("") || `<span class="empty">No bookmarks yet. Star courses on the Courses page.</span>`}</div></div>
-  <div class="${S.prefs.dense ? "dense" : ""}">${years.map(y => `<div class="year"><div class="yearhead"><h2>${y.label}</h2><span class="small muted">${fmtCU(y.terms.reduce((a, k) => a + termCU(k), 0))} c.u.</span></div><div class="terms">${y.terms.map(k => {
+  <div class="${P.dense ? "dense" : ""}">${years.map(y => `<div class="year"><div class="yearhead"><h2>${y.label}</h2><span class="small muted">${fmtCU(y.terms.reduce((a, k) => a + termCU(k), 0))} c.u.</span></div><div class="terms">${y.terms.map(k => {
     const cu = termCU(k);
     return `<div class="term ${pastWarn(k) ? "past" : ""}" data-drop="${k}"><div class="termhead"><span>${termLabel(k)}</span><span class="cu ${cu > 5.5 ? "over" : ""}">${fmtCU(cu)} c.u.${cu > 5.5 ? " · overload" : ""}</span></div>
       <div class="chips">${(S.plan[k] || []).map(it => chipHTML(it, k)).join("") || `<div class="empty">No courses planned</div>`}</div>
@@ -536,15 +700,15 @@ function vPlan() {
 after.plan = () => {
   document.querySelectorAll("[data-addterm]").forEach(inp => attachSuggest(inp, id => addCourse(id, inp.dataset.addterm)));
 };
-function maybeWarnOffered(id, k) { const c = COURSES.get(id); if (c && S.prefs.warn.offered && !offeredIn(c, k)) toast(`${codeOf(id)} wasn't offered in ${SEASON[k[4]].toLowerCase()} 2025–27`); }
+function maybeWarnOffered(id, k) { const c = COURSES.get(id); if (c && P.warn.offered && !offeredIn(c, k)) toast(`${codeOf(id)} wasn't offered in ${SEASON[k[4]].toLowerCase()} 2025–27`); }
 function addCourse(id, k, silent) {
   const c = COURSES.get(id); if (!c) { toast("Course not found"); return; }
   const dup = plannedIds().has(id);
   termItems(k).push({ id, k: uid() });
   save(); render();
   if (!silent) toast(`Added ${codeOf(id)} to ${termLabel(k)}${dup ? " (already planned elsewhere)" : ""}`);
-  if (S.prefs.warn.offered && !offeredIn(c, k)) setTimeout(() => toast(`Heads up: ${codeOf(id)} wasn't offered in ${SEASON[k[4]].toLowerCase()} 2025–27`), 900);
-  else if (S.prefs.warn.conflict && k[4] !== "B") { const conf = scheduleFor(k).conflicts.filter(x => x.includes(id)); if (conf.length) setTimeout(() => toast(`Time conflict: ${conf[0].map(codeOf).join(" & ")}`), 900); }
+  if (P.warn.offered && !offeredIn(c, k)) setTimeout(() => toast(`Heads up: ${codeOf(id)} wasn't offered in ${SEASON[k[4]].toLowerCase()} 2025–27`), 900);
+  else if (P.warn.conflict && k[4] !== "B") { const conf = scheduleFor(k).conflicts.filter(x => x.includes(id)); if (conf.length) setTimeout(() => toast(`Time conflict: ${conf[0].map(codeOf).join(" & ")}`), 900); }
 }
 function attachSuggest(inp, onPick) {
   let box = null, hl = 0, items = [];
@@ -679,31 +843,84 @@ function vExport() {
 }
 
 // Settings
+const SETTINGS_SECTIONS = [["account", "Account"], ["appearance", "Appearance"], ["school", "School & major"], ["privacy", "Privacy"], ["warnings", "Warnings"], ["data", "Your data"]];
 function vSettings() {
-  const w = S.prefs.warn; const tg = (key, label, desc, val) => `<label class="toggle"><input type="checkbox" data-pref="${key}" ${val ? "checked" : ""}><span><b>${label}</b><br><span class="small muted">${desc}</span></span></label>`;
-  return `<h1>Settings</h1><p class="sub">${esc(syncLabel())}. ${sync.mode === "cloud" ? "Your plan follows you to any device where you open this page signed in." : "Open this page signed in to Claude to save your plan to your account."}</p>
-  <div class="grid g2" style="align-items:start">
-    <div class="card"><h3>Student</h3>
-      <div class="row between" style="padding:8px 0"><span>School</span><select data-change="school"><option value="">Choose…</option>${Object.entries(SCHOOLS).map(([k, v]) => `<option value="${k}" ${S.school === k ? "selected" : ""}>${v.name}</option>`).join("")}</select></div>
-      <div class="row between" style="padding:8px 0;border-top:1px solid var(--line)"><span>Fall you matriculated</span><select data-change="start"><option value="">Year…</option>${[2022, 2023, 2024, 2025, 2026, 2027].map(y => `<option ${S.start === y ? "selected" : ""}>${y}</option>`).join("")}</select></div>
-      <div class="row between" style="padding:8px 0;border-top:1px solid var(--line)"><span>Years shown in the planner</span><div class="seg"><button data-act="years" data-d="4" class="${(S.years || 4) === 4 ? "on" : ""}">4</button><button data-act="years" data-d="5" class="${S.years === 5 ? "on" : ""}">5</button></div></div>
-    </div>
-    <div class="card"><h3>Display</h3>
-      ${tg("desc", "Show course descriptions", "Show the first lines of each description in the course list.", S.prefs.desc)}
-      ${tg("dense", "Compact planner", "Hide course titles on planner chips.", S.prefs.dense)}
-      <div class="row between" style="padding:10px 0;border-top:1px solid var(--line)"><span>Courses per page</span><div class="seg">${[10, 20, 50].map(n => `<button data-act="per" data-v="${n}" class="${S.prefs.per === n ? "on" : ""}">${n}</button>`).join("")}</div></div>
-    </div>
-    <div class="card"><h3>Warnings</h3>
-      ${tg("warn.remove", "Course removal", "Ask before removing a course from the plan.", w.remove)}
-      ${tg("warn.program", "Program removal", "Ask before removing a major or minor.", w.program)}
-      ${tg("warn.offered", "Not-offered semester", "Warn when a course wasn't offered that season in 2025–27.", w.offered)}
-      ${tg("warn.conflict", "Schedule conflicts", "Warn when a new course overlaps another's meeting time.", w.conflict)}
-    </div>
-    <div class="card"><h3>Your data</h3>
-      <p class="small muted" style="margin-top:0">Back up your plan, move it between accounts, or start over.</p>
-      <div class="row"><button class="btn" data-act="copyjson">Copy backup</button><button class="btn" data-act="importjson">Restore from backup</button><button class="btn" data-act="reset" style="color:var(--sienna)">Reset everything</button></div>
-    </div>
-  </div>`;
+  const tg = (key, label, desc, val, dis) => `<label class="toggle"><input type="checkbox" data-pref="${key}" ${val ? "checked" : ""} ${dis ? "disabled" : ""}><span><b>${label}</b><br><span class="small muted">${desc}</span></span></label>`;
+  const w = P.warn, pv = P.privacy;
+  const sec = (id, title, body) => `<section class="card setsec" id="set-${id}"><h2>${title}</h2>${body}</section>`;
+
+  // Account
+  let account;
+  if (acct.backend === "server" && acct.user) {
+    account = `<div class="row between"><div class="row"><span class="avatar lg">${esc(acct.user.username[0].toUpperCase())}</span><div><div style="font-weight:600;font-size:16px">${esc(acct.user.username)}</div><div class="small muted">Member since ${new Date(acct.user.createdAt).toLocaleDateString(undefined, { month: "long", year: "numeric" })} · ${esc(syncLabel())}</div></div></div>
+      <div class="row"><button class="btn" data-act="signout">Sign out</button></div></div>
+      <h3 style="margin-top:22px">Change password</h3>
+      <form id="pwform" class="row"><input type="password" name="current" placeholder="Current password" autocomplete="current-password" required style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px"><input type="password" name="next" placeholder="New password (8+ characters)" autocomplete="new-password" required minlength="8" style="flex:1;min-width:160px;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px"><button class="btn">Update</button></form>
+      <p class="small faint" style="margin:6px 0 0">Changing your password signs you out everywhere else.</p>
+      <div class="row" style="margin-top:18px"><button class="btn" data-act="logoutall">Sign out other devices</button><a class="btn" href="/api/export" download>Download my data</a><button class="btn" data-act="delacct" style="color:var(--sienna)">Delete account</button></div>`;
+  } else if (acct.backend === "server") {
+    account = `<p class="muted" style="margin-top:0">Create a free account to save your plan and settings and open them on any device. Without one, everything stays in this browser.</p>
+      <div class="row"><button class="btn pri" data-act="signup">Create account</button><button class="btn" data-act="signin">Sign in</button></div>`;
+  } else {
+    account = `<p class="muted" style="margin:0">${esc(syncLabel())}. ${sync.mode === "cloud" ? "Your plan follows you to any device where you open this page signed in to Claude." : "Accounts are available when the planner runs on its own server (see the README)."}</p>`;
+  }
+
+  // School & major
+  const scList = Object.entries(SCHOOLS);
+  const majorsIn = S.school ? PROGRAMS.filter(p => p.school === S.school && !p.minor) : [];
+  const fq = (UI.setMajorQ || "").toLowerCase();
+  const shown = majorsIn.filter(p => !fq || p.name.toLowerCase().includes(fq));
+  const school = `<div class="schoolpick">${scList.map(([k, v]) => `<button class="schoolcard ${S.school === k ? "on" : ""}" data-act="setschool" data-v="${k}"><b>${esc(v.short)}</b><span class="small muted">${esc(v.degree)} · ${PROGRAMS.filter(p => p.school === k && !p.minor).length} majors</span></button>`).join("")}</div>
+    <div class="row between" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)"><span>Fall you started at Penn</span><select data-change="start"><option value="">Year…</option>${[2022, 2023, 2024, 2025, 2026, 2027].map(y => `<option ${S.start === y ? "selected" : ""}>${y}</option>`).join("")}</select></div>
+    <div class="row between" style="padding:12px 0;border-bottom:1px solid var(--line)"><span>Years shown in the planner</span><div class="seg"><button data-act="years" data-d="4" class="${(S.years || 4) === 4 ? "on" : ""}">4</button><button data-act="years" data-d="5" class="${S.years === 5 ? "on" : ""}">5</button></div></div>
+    ${S.school ? `<div class="row between" style="margin:16px 0 8px"><h3 style="margin:0">Majors in ${esc(SCHOOLS[S.school].short)} (${majorsIn.length})</h3><input type="search" id="smq" placeholder="Filter majors" value="${esc(UI.setMajorQ || "")}" style="width:200px"></div>
+      ${S.programs.length ? `<div class="row" style="gap:6px;margin-bottom:10px">${S.programs.map(n => `<span class="pill g">${esc(n)} <button class="star" style="font-size:12px;padding:0 0 0 4px;color:inherit" data-act="rmprog" data-n="${esc(n)}" title="Remove">✕</button></span>`).join("")}</div>` : ""}
+      <div class="majorlist">${shown.map(p => { const sel = S.programs.includes(p.name); return `<label class="majorrow"><input type="checkbox" data-act="${sel ? "rmprog" : "addprog"}" data-n="${esc(p.name)}" ${sel ? "checked" : ""}><span style="flex:1">${esc(p.name)}</span>${programDef(p.name) ? `<span class="pill g">Tracked</span>` : ""}</label>`; }).join("") || `<div class="empty">No majors match.</div>`}</div>
+      <p class="small muted" style="margin-bottom:0">Looking for a minor or a major in another school? <a href="#programs">Browse all programs →</a></p>`
+    : `<p class="muted">Pick your school to see its majors.</p>`}`;
+
+  const privacy = `<p class="small muted" style="margin-top:0">There are no ads, analytics or tracking. Here's everything stored and where.</p>
+    ${tg("privacy.cookies", "Remember my preferences with a cookie", "Theme, display and warning settings are kept in a first-party cookie for a year. Turn off to forget them when you close the tab (only this choice itself is remembered).", pv.cookies)}
+    ${tg("privacy.localPlan", "Keep a copy of my plan in this browser", "Turn off on a shared computer. Your plan then lives only in your account (if signed in), and signing out clears it from this browser.", pv.localPlan)}
+    ${acct.backend === "server" ? tg("privacy.remember", "Stay signed in on this device", "Keeps you signed in for 30 days. Off: you're signed out after about a day or when the browser closes. Applies the next time you sign in.", pv.remember) : ""}
+    ${acct.user ? tg("privacy.sync", "Sync my plan to my account", "Off: changes stay on this device and your account keeps its last saved plan.", pv.sync) : ""}
+    ${tg("privacy.googleFonts", "Load fonts from Google Fonts", "Off: uses your system's fonts so no request goes to Google.", pv.googleFonts)}
+    <div class="row" style="margin-top:14px"><button class="btn" data-act="clearlocal" style="color:var(--sienna)">Clear cookies &amp; data on this device</button></div>
+    <dl class="kv small" style="margin-top:16px"><dt>plnr_prefs</dt><dd>Cookie · your preferences · 1 year${pv.cookies ? "" : " (choice only)"}</dd>${acct.backend === "server" ? `<dt>plnr_sid</dt><dd>Cookie · keeps you signed in · HttpOnly, can't be read by scripts</dd>` : ""}<dt>Local storage</dt><dd>${pv.localPlan ? "Your plan, on this device only" : "Not used"}</dd>${acct.user ? `<dt>Account</dt><dd>Username, password hash, your plan and preferences</dd>` : ""}</dl>`;
+
+  return `<h1>Settings</h1><p class="sub">${esc(syncLabel())}.</p>
+  <div class="setwrap"><nav class="setnav">${SETTINGS_SECTIONS.map(([id, l]) => `<a href="#settings" data-act="setjump" data-s="${id}">${l}</a>`).join("")}</nav>
+  <div class="grid">
+    ${sec("account", "Account", account)}
+    ${sec("appearance", "Appearance", `<div class="row between" style="padding-bottom:12px"><div><b>Theme</b><div class="small muted">System follows your device's light/dark setting.</div></div><div class="seg">${[["system", "System"], ["light", "Light"], ["dark", "Dark"]].map(([v, l]) => `<button data-act="theme" data-v="${v}" class="${P.theme === v ? "on" : ""}">${l}</button>`).join("")}</div></div>
+      ${tg("desc", "Show course descriptions", "Show the first lines of each description in the course list.", P.desc)}
+      ${tg("dense", "Compact planner", "Hide course titles on planner chips.", P.dense)}
+      <div class="row between" style="padding:10px 0;border-top:1px solid var(--line)"><span>Courses per page</span><div class="seg">${[10, 20, 50].map(n => `<button data-act="per" data-v="${n}" class="${P.per === n ? "on" : ""}">${n}</button>`).join("")}</div></div>`)}
+    ${sec("school", "School &amp; major", school)}
+    ${sec("privacy", "Privacy", privacy)}
+    ${sec("warnings", "Warnings", `${tg("warn.remove", "Course removal", "Ask before removing a course from the plan.", w.remove)}${tg("warn.program", "Program removal", "Ask before removing a major or minor.", w.program)}${tg("warn.offered", "Not-offered semester", "Warn when a course wasn't offered that season in 2025–27.", w.offered)}${tg("warn.conflict", "Schedule conflicts", "Warn when a new course overlaps another's meeting time.", w.conflict)}`)}
+    ${sec("data", "Your data", `<p class="small muted" style="margin-top:0">Back up your plan, move it between accounts, or start over.</p><div class="row"><button class="btn" data-act="copyjson">Copy backup</button><button class="btn" data-act="importjson">Restore from backup</button><button class="btn" data-act="reset" style="color:var(--sienna)">Reset plan</button></div>`)}
+  </div></div>`;
+}
+after.settings = () => {
+  const i = $("#smq");
+  if (i) { let t; i.addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => { UI.setMajorQ = i.value; const y = scrollY; render(); scrollTo(0, y); const n = $("#smq"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); }, 150); }); }
+  const pf = $("#pwform");
+  if (pf) pf.addEventListener("submit", async e => {
+    e.preventDefault(); const f = new FormData(pf);
+    try { await apiCall("POST", "/api/password", { current: f.get("current"), next: f.get("next") }); pf.reset(); toast("Password updated"); }
+    catch (err) { toast(err.message); }
+  });
+};
+function deleteAccountModal() {
+  const m = modal(`<h2>Delete your account?</h2><p class="muted">This permanently deletes <b>${esc(acct.user.username)}</b>, its saved plan and preferences. It can't be undone. Your plan stays in this browser unless you've turned that off.</p>
+    <input type="password" id="dpw" placeholder="Enter your password to confirm" autocomplete="current-password" style="width:100%;background:var(--surface);border:1px solid var(--line2);border-radius:8px;padding:7px 10px">
+    <div class="small" id="derr" style="color:var(--sienna);min-height:18px;margin-top:6px"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:10px"><button class="btn" data-close>Cancel</button><button class="btn pri" id="dok" style="background:var(--sienna);border-color:var(--sienna)">Delete account</button></div>`);
+  $("#dok", m).onclick = async () => {
+    try { await apiCall("POST", "/api/delete-account", { password: $("#dpw", m).value }); m.remove(); acct.user = null; if (!P.privacy.localPlan) loadState(null); renderAcct(); render(); toast("Account deleted"); }
+    catch (err) { $("#derr", m).textContent = err.message; }
+  };
 }
 
 // ---------- menus, modals ----------
@@ -775,23 +992,39 @@ document.addEventListener("click", e => {
   else if (act === "findreq") { e.preventDefault(); Object.assign(UI, { req: d.p + "||" + d.r, attr: "", q: "", page: 0, level: "all", dept: "" }); go("courses"); }
   else if (act === "setschool") { S.school = d.v; save(); render(); }
   else if (act === "progf") { UI.progFilter = d.v; render(); }
-  else if (act === "addprog") { if (!S.programs.includes(d.n)) S.programs.push(d.n); const p = parseProgram(d.n); if (!S.school && p.school) S.school = p.school; save(); render(); toast(`Added ${d.n}`); }
-  else if (act === "rmprog") { const doIt = () => { S.programs = S.programs.filter(x => x !== d.n); for (const k in S.plan) S.plan[k].forEach(it => { if (it.o && it.o.startsWith("p:" + d.n + "|")) delete it.o; }); save(); render(); }; S.prefs.warn.program ? confirmBox(`Remove ${d.n}?`, "Remove", doIt) : doIt(); }
+  else if (act === "addprog") { if (!S.programs.includes(d.n)) S.programs.push(d.n); const p = parseProgram(d.n); if (!S.school && p.school) S.school = p.school; save(); keepScroll(render); toast(`Added ${d.n}`); }
+  else if (act === "rmprog") { const doIt = () => { S.programs = S.programs.filter(x => x !== d.n); for (const k in S.plan) S.plan[k].forEach(it => { if (it.o && it.o.startsWith("p:" + d.n + "|")) delete it.o; }); save(); keepScroll(render); }; (P.warn.program && a.tagName !== "INPUT") ? confirmBox(`Remove ${d.n}?`, "Remove", doIt) : doIt(); }
   else if (act === "chip") { e.stopPropagation(); chipMenu(d.key, e.clientX, e.clientY); }
   else if (act === "bmchip") { const r = a.getBoundingClientRect(); openMenu(r.left, r.bottom + 4, termMenuHTML(d.bm) + `<div class="sep"></div><button data-act="bm" data-id="${d.bm}">Remove bookmark</button>`); }
   else if (act === "moveto") { const f = findItem(d.k); closeMenu(); if (f) { S.plan[f.term].splice(f.idx, 1); termItems(d.t).push(f.item); save(); render(); maybeWarnOffered(f.item.id, d.t); } }
   else if (act === "ovr") { const f = findItem(d.k); closeMenu(); if (f) { if (d.v) f.item.o = d.v; else delete f.item.o; save(); render(); } }
   else if (act === "tobm") { const f = findItem(d.k); closeMenu(); if (f) { S.plan[f.term].splice(f.idx, 1); if (!S.bm.includes(f.item.id)) S.bm.push(f.item.id); save(); render(); } }
-  else if (act === "remove") { const f = findItem(d.k); closeMenu(); if (!f) return; const doIt = () => { S.plan[f.term].splice(f.idx, 1); save(); render(); }; S.prefs.warn.remove ? confirmBox(`Remove ${codeOf(f.item.id)} from ${termLabel(f.term)}?`, "Remove", doIt) : doIt(); }
+  else if (act === "remove") { const f = findItem(d.k); closeMenu(); if (!f) return; const doIt = () => { S.plan[f.term].splice(f.idx, 1); save(); render(); }; P.warn.remove ? confirmBox(`Remove ${codeOf(f.item.id)} from ${termLabel(f.term)}?`, "Remove", doIt) : doIt(); }
   else if (act === "years") { S.years = +d.d; save(); render(); }
-  else if (act === "per") { S.prefs.per = +d.v; UI.page = 0; save(); render(); }
+  else if (act === "per") { P.per = +d.v; UI.page = 0; savePrefs(); keepScroll(render); }
+  else if (act === "theme") { P.theme = d.v; savePrefs(); keepScroll(render); }
+  else if (act === "signin") { closeMenu(); authModal("login"); }
+  else if (act === "signup") { closeMenu(); authModal("signup"); }
+  else if (act === "signout") { closeMenu(); signOut(); }
+  else if (act === "acctmenu") { const r = a.getBoundingClientRect(); openMenu(r.right - 220, r.bottom + 6, `<div class="lbl">Signed in as ${esc(acct.user.username)}</div><div class="lbl" style="text-transform:none;letter-spacing:0">${esc(syncLabel())}</div><div class="sep"></div><button data-act="gosettings">Account &amp; settings</button><button data-act="signout">Sign out</button>`); }
+  else if (act === "gosettings") { closeMenu(); go("settings"); }
+  else if (act === "logoutall") { apiCall("POST", "/api/logout-all", {}).then(() => toast("Signed out of all other devices"), err => toast(err.message)); }
+  else if (act === "delacct") deleteAccountModal();
+  else if (act === "setjump") { e.preventDefault(); const el = document.getElementById("set-" + d.s); el && el.scrollIntoView({ behavior: "smooth", block: "start" }); }
+  else if (act === "cnok") { P.notice = true; savePrefs(); a.closest(".cnotice").remove(); }
+  else if (act === "cnset") { P.notice = true; savePrefs(); a.closest(".cnotice").remove(); setTimeout(() => { const el = document.getElementById("set-privacy"); el && el.scrollIntoView({ block: "start" }); }, 50); }
+  else if (act === "clearlocal") confirmBox("Clear all cookies and saved data on this device?" + (acct.user ? " You'll be signed out; your account keeps its copy." : " Your plan will be erased from this browser."), "Clear", async () => {
+    if (acct.user) { try { await apiCall("POST", "/api/logout", {}); } catch (err) {} acct.user = null; }
+    try { localStorage.removeItem(LS_KEY); localStorage.removeItem(PREF_COOKIE); } catch (err) {}
+    writeCookie(PREF_COOKIE, "", 0); P = prefDefaults(); loadState(null); applyTheme(); renderAcct(); render(); toast("Cleared this device");
+  });
   else if (act === "ap") { if (d.v) S.ap[d.e] = +d.v; else delete S.ap[d.e]; save(); render(); }
   else if (act === "rmtr") { S.transfer = S.transfer.filter(t => t.k !== d.k); save(); render(); }
   else if (act === "copyplan") copyText(planText(), "Plan copied");
   else if (act === "copyjson") copyText(JSON.stringify(S), "Backup copied — paste it somewhere safe");
   else if (act === "importjson") { const s = modal(`<h2>Restore from backup</h2><p class="small muted">Paste a backup copied from Settings. This replaces your current plan.</p><textarea id="ij" style="width:100%;height:160px;font-family:var(--mono);font-size:12px;border:1px solid var(--line2);border-radius:8px;background:var(--surface);color:var(--ink);padding:8px"></textarea><div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn" data-close>Cancel</button><button class="btn pri" id="ijok">Restore</button></div>`);
-    $("#ijok", s).onclick = () => { try { const v = JSON.parse($("#ij", s).value); if (!v || typeof v !== "object" || !v.plan) throw 0; S = Object.assign(defaults(), v); S.prefs = Object.assign(defaults().prefs, S.prefs || {}); S.prefs.warn = Object.assign(defaults().prefs.warn, S.prefs.warn || {}); s.remove(); save(); render(); toast("Plan restored"); } catch (err) { toast("That doesn't look like a backup"); } }; }
-  else if (act === "reset") confirmBox("Reset your whole plan? This clears courses, programs, credit and settings.", "Reset everything", () => { S = defaults(); save(); render(); toast("Plan reset"); });
+    $("#ijok", s).onclick = () => { try { const v = JSON.parse($("#ij", s).value); if (!v || typeof v !== "object" || !v.plan) throw 0; loadState(v); s.remove(); save(); render(); toast("Plan restored"); } catch (err) { toast("That doesn't look like a backup"); } }; }
+  else if (act === "reset") confirmBox("Reset your whole plan? This clears courses, programs and credit (your settings stay).", "Reset plan", () => { loadState(null); save(); render(); toast("Plan reset"); });
 });
 function copyText(t, msg) { (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(() => toast(msg), () => { const s = modal(`<h2>Copy this text</h2><textarea style="width:100%;height:240px;font-family:var(--mono);font-size:12px">${esc(t)}</textarea><div class="row" style="justify-content:flex-end;margin-top:10px"><button class="btn" data-close>Done</button></div>`); $("textarea", s).select(); }); }
 document.addEventListener("change", e => {
@@ -800,9 +1033,16 @@ document.addEventListener("change", e => {
   const ch = el.dataset.change;
   if (ch === "school") { S.school = el.value || null; save(); render(); }
   else if (ch === "start") { S.start = el.value ? +el.value : null; save(); render(); }
-  else if (ch === "dense") { S.prefs.dense = el.checked; save(); render(); }
+  else if (ch === "dense") { P.dense = el.checked; savePrefs(); render(); }
   else if (ch === "schedTerm") { UI.schedTerm = el.value; render(); }
-  if (el.dataset.pref) { const p = el.dataset.pref; if (p.startsWith("warn.")) S.prefs.warn[p.slice(5)] = el.checked; else S.prefs[p] = el.checked; save(); render(); }
+  if (el.dataset.pref) {
+    const p = el.dataset.pref, [grp, key] = p.includes(".") ? p.split(".") : [null, p];
+    if (grp) P[grp][key] = el.checked; else P[key] = el.checked;
+    savePrefs();
+    if (p === "privacy.localPlan") saveLocal();
+    if (p === "privacy.sync" && el.checked && acct.user) pushServer();
+    keepScroll(render);
+  }
 });
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeMenu(); document.querySelectorAll(".scrim").forEach(s => s.remove()); } });
 window.addEventListener("hashchange", () => { readRoute(); render(); window.scrollTo(0, 0); });
@@ -824,5 +1064,5 @@ window.addEventListener("hashchange", () => { readRoute(); render(); window.scro
 }
 readRoute(); renderTabs();
 fetch("courses.json").then(r => r.json()).then(rows => { loadCourses(rows); render(); }).catch(() => { $("#app").innerHTML = `<div class="loading">Couldn't load the course catalog. Try reloading the page.</div>`; });
-initCloud();
+renderAcct(); cookieNotice(); initAccount();
 })();

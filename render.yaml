@@ -1,0 +1,22 @@
+# Render Blueprint: a Node web service that serves the app and the account API.
+# Accounts are stored in SQLite under DATA_DIR. On Render, the filesystem resets on every
+# deploy unless you attach a persistent disk, so the disk below keeps accounts across deploys.
+services:
+  - type: web
+    name: penncourseplaner
+    runtime: node
+    plan: starter            # persistent disks need a paid instance; see README for the free option
+    buildCommand: "echo no build step"
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22.13.0"
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: planner-data
+      mountPath: /var/data
+      sizeGB: 1
